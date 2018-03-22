@@ -19,15 +19,22 @@ package server
 import (
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/heptio/authenticator/pkg/config"
 	"github.com/heptio/authenticator/pkg/token"
 
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
+	"github.com/aws/aws-sdk-go/aws/ec2metadata"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -52,9 +59,13 @@ type handler struct {
 	http.ServeMux
 	lowercaseRoleMap map[string]config.RoleMapping
 	lowercaseUserMap map[string]config.UserMapping
+	lowercaseNodeMap map[string]config.NodeMapping
 	accountMap       map[string]bool
 	verifier         token.Verifier
 	metrics          metrics
+	sess             *session.Session
+	nodeNameCache    map[string]string
+	lock             sync.Mutex
 }
 
 // metrics are handles to the collectors for prometheous for the various metrics we are tracking.
@@ -94,6 +105,12 @@ func (c *Server) Run() {
 			"username": mapping.Username,
 			"groups":   mapping.Groups,
 		}).Infof("mapping IAM user")
+	}
+	for _, mapping := range c.NodeMappings {
+		logrus.WithFields(logrus.Fields{
+			"role":   mapping.RoleARN,
+			"groups": mapping.Groups,
+		}).Infof("mapping Node role")
 	}
 	for _, account := range c.AutoMappedAWSAccounts {
 		logrus.WithField("accountID", account).Infof("mapping IAM Account")
@@ -138,12 +155,17 @@ func (c *Server) Run() {
 }
 
 func (c *Server) getHandler() *handler {
+	sess := c.newSession()
+
 	h := &handler{
 		lowercaseRoleMap: make(map[string]config.RoleMapping),
 		lowercaseUserMap: make(map[string]config.UserMapping),
+		lowercaseNodeMap: make(map[string]config.NodeMapping),
 		accountMap:       make(map[string]bool),
 		verifier:         token.NewVerifier(c.ClusterID),
 		metrics:          createMetrics(),
+		sess:             sess,
+		nodeNameCache:    make(map[string]string),
 	}
 	for _, m := range c.RoleMappings {
 		h.lowercaseRoleMap[strings.ToLower(m.RoleARN)] = m
@@ -151,7 +173,9 @@ func (c *Server) getHandler() *handler {
 	for _, m := range c.UserMappings {
 		h.lowercaseUserMap[strings.ToLower(m.UserARN)] = m
 	}
-
+	for _, m := range c.NodeMappings {
+		h.lowercaseNodeMap[strings.ToLower(m.RoleARN)] = m
+	}
 	for _, m := range c.AutoMappedAWSAccounts {
 		h.accountMap[m] = true
 	}
@@ -159,6 +183,34 @@ func (c *Server) getHandler() *handler {
 	h.HandleFunc("/authenticate", h.authenticateEndpoint)
 	h.Handle("/metrics", promhttp.Handler())
 	return h
+}
+
+func (c *Server) newSession() *session.Session {
+	// Initial credentials loaded from SDK's default credential chain, such as
+	// the environment, shared credentials (~/.aws/credentials), or EC2 Instance
+	// Role.
+
+	var cfg aws.Config
+	sess := session.Must(session.NewSession())
+	if c.Region != "" {
+		cfg.Region = aws.String(c.Region)
+	} else {
+		ec2metadata := ec2metadata.New(sess)
+		region, err := ec2metadata.Region()
+		if err != nil {
+			logrus.WithError(err).Fatal("Region not found in config and failed to discover from ec2 instance metadata")
+		}
+		cfg.Region = aws.String(region)
+	}
+	sess = session.Must(session.NewSession(&cfg))
+	if c.DefaultEC2DescribeInstancesRoleARN != "" {
+		logrus.WithFields(logrus.Fields{
+			"roleARN": c.DefaultEC2DescribeInstancesRoleARN,
+		}).Infof("Using assumed role for EC2 API")
+		cfg.Credentials = stscreds.NewCredentials(sess, c.DefaultEC2DescribeInstancesRoleARN)
+		sess = session.Must(session.NewSession(&cfg))
+	}
+	return sess
 }
 
 func createMetrics() metrics {
@@ -240,6 +292,16 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	} else if userMapping, exists := h.lowercaseUserMap[arnLower]; exists {
 		username = userMapping.Username
 		groups = userMapping.Groups
+	} else if nodeMapping, exists := h.lowercaseNodeMap[arnLower]; exists {
+		privateDNS, err := h.getPrivateDNSFromEC2(identity.SessionName)
+		if err != nil {
+			log.WithError(err).Warn("access denied because node private DNS was not found")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write(tokenReviewDenyJSON)
+			return
+		}
+		username = privateDNS
+		groups = nodeMapping.Groups
 	} else if _, exists := h.accountMap[identity.AccountID]; exists {
 		groups = []string{}
 		username = identity.CanonicalARN
@@ -274,6 +336,51 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 			},
 		},
 	})
+}
+
+func (h *handler) getPrivateDNSName(id string) (string, error) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	name, ok := h.nodeNameCache[id]
+	if ok {
+		return name, nil
+	}
+	return "", errors.New("instance id not found")
+}
+
+func (h *handler) setPrivateDNSName(id string, privateDNSName string) {
+	h.lock.Lock()
+	defer h.lock.Unlock()
+	h.nodeNameCache[id] = privateDNSName
+}
+
+func (h *handler) getPrivateDNSFromEC2(id string) (string, error) {
+	privateDNSName, err := h.getPrivateDNSName(id)
+	if err == nil {
+		return config.NodeNamePrefix + privateDNSName, nil
+	}
+
+	// Look up instance from EC2 API
+	instanceIds := []*string{&id}
+	ec2Service := ec2.New(h.sess)
+	output, err := ec2Service.DescribeInstances(&ec2.DescribeInstancesInput{
+		InstanceIds: instanceIds,
+	})
+	if err != nil {
+		return "", err
+	}
+	for _, reservation := range output.Reservations {
+		for _, instance := range reservation.Instances {
+			if aws.StringValue(instance.InstanceId) == id {
+				privateDNSName = aws.StringValue(instance.PrivateDnsName)
+				h.setPrivateDNSName(id, privateDNSName)
+			}
+		}
+	}
+	if privateDNSName == "" {
+		return "", errors.New(fmt.Sprintf("failed to find private DNS Name for %s", id))
+	}
+	return config.NodeNamePrefix + privateDNSName, nil
 }
 
 func renderTemplate(template string, identity *token.Identity) string {
