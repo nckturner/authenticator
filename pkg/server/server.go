@@ -31,10 +31,12 @@ import (
 	"github.com/heptio/authenticator/pkg/token"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/credentials"
 	"github.com/aws/aws-sdk-go/aws/credentials/stscreds"
 	"github.com/aws/aws-sdk-go/aws/ec2metadata"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
@@ -63,9 +65,7 @@ type handler struct {
 	accountMap       map[string]bool
 	verifier         token.Verifier
 	metrics          metrics
-	sess             *session.Session
-	nodeNameCache    map[string]string
-	lock             sync.Mutex
+	nodeNameProvider NodeNameProvider
 }
 
 // metrics are handles to the collectors for prometheous for the various metrics we are tracking.
@@ -155,8 +155,6 @@ func (c *Server) Run() {
 }
 
 func (c *Server) getHandler() *handler {
-	sess := c.newSession()
-
 	h := &handler{
 		lowercaseRoleMap: make(map[string]config.RoleMapping),
 		lowercaseUserMap: make(map[string]config.UserMapping),
@@ -164,8 +162,7 @@ func (c *Server) getHandler() *handler {
 		accountMap:       make(map[string]bool),
 		verifier:         token.NewVerifier(c.ClusterID),
 		metrics:          createMetrics(),
-		sess:             sess,
-		nodeNameCache:    make(map[string]string),
+		nodeNameProvider: NewNodeNameEC2PrivateDNSProvider(c.Region, c.DefaultEC2DescribeInstancesRoleARN),
 	}
 	for _, m := range c.RoleMappings {
 		h.lowercaseRoleMap[strings.ToLower(m.RoleARN)] = m
@@ -183,34 +180,6 @@ func (c *Server) getHandler() *handler {
 	h.HandleFunc("/authenticate", h.authenticateEndpoint)
 	h.Handle("/metrics", promhttp.Handler())
 	return h
-}
-
-func (c *Server) newSession() *session.Session {
-	// Initial credentials loaded from SDK's default credential chain, such as
-	// the environment, shared credentials (~/.aws/credentials), or EC2 Instance
-	// Role.
-
-	var cfg aws.Config
-	sess := session.Must(session.NewSession())
-	if c.Region != "" {
-		cfg.Region = aws.String(c.Region)
-	} else {
-		ec2metadata := ec2metadata.New(sess)
-		region, err := ec2metadata.Region()
-		if err != nil {
-			logrus.WithError(err).Fatal("Region not found in config and failed to discover from ec2 instance metadata")
-		}
-		cfg.Region = aws.String(region)
-	}
-	sess = session.Must(session.NewSession(&cfg))
-	if c.DefaultEC2DescribeInstancesRoleARN != "" {
-		logrus.WithFields(logrus.Fields{
-			"roleARN": c.DefaultEC2DescribeInstancesRoleARN,
-		}).Infof("Using assumed role for EC2 API")
-		cfg.Credentials = stscreds.NewCredentials(sess, c.DefaultEC2DescribeInstancesRoleARN)
-		sess = session.Must(session.NewSession(&cfg))
-	}
-	return sess
 }
 
 func createMetrics() metrics {
@@ -283,7 +252,17 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	log = log.WithField("arn", identity.CanonicalARN)
 	var username string
 	var groups []string
-	if roleMapping, exists := h.lowercaseRoleMap[arnLower]; exists {
+	if nodeMapping, exists := h.lowercaseNodeMap[arnLower]; exists {
+		nodeName, err := h.nodeNameProvider.GetNodeName(identity.SessionName)
+		if err != nil {
+			log.WithError(err).Warn("access denied because node private DNS was not found")
+			w.WriteHeader(http.StatusForbidden)
+			w.Write(tokenReviewDenyJSON)
+			return
+		}
+		username = nodeName
+		groups = nodeMapping.Groups
+	} else if roleMapping, exists := h.lowercaseRoleMap[arnLower]; exists {
 		username = renderTemplate(roleMapping.Username, identity)
 		groups = []string{}
 		for _, groupPattern := range roleMapping.Groups {
@@ -292,16 +271,6 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	} else if userMapping, exists := h.lowercaseUserMap[arnLower]; exists {
 		username = userMapping.Username
 		groups = userMapping.Groups
-	} else if nodeMapping, exists := h.lowercaseNodeMap[arnLower]; exists {
-		privateDNS, err := h.getPrivateDNSFromEC2(identity.SessionName)
-		if err != nil {
-			log.WithError(err).Warn("access denied because node private DNS was not found")
-			w.WriteHeader(http.StatusForbidden)
-			w.Write(tokenReviewDenyJSON)
-			return
-		}
-		username = privateDNS
-		groups = nodeMapping.Groups
 	} else if _, exists := h.accountMap[identity.AccountID]; exists {
 		groups = []string{}
 		username = identity.CanonicalARN
@@ -338,31 +307,91 @@ func (h *handler) authenticateEndpoint(w http.ResponseWriter, req *http.Request)
 	})
 }
 
-func (h *handler) getPrivateDNSName(id string) (string, error) {
-	h.lock.Lock()
-	defer h.lock.Unlock()
-	name, ok := h.nodeNameCache[id]
+type NodeNameProvider interface {
+	// Get a node name from instance ID
+	GetNodeName(string) (string, error)
+}
+
+type nodeNameEC2PrivateDNSProvider struct {
+	sess          *session.Session
+	nodeNameCache map[string]string
+	lock          sync.Mutex
+}
+
+func NewNodeNameEC2PrivateDNSProvider(region string, roleARN string) NodeNameProvider {
+	return &nodeNameEC2PrivateDNSProvider{
+		sess:          newSession(region, roleARN),
+		nodeNameCache: make(map[string]string),
+	}
+}
+
+func newSession(region string, roleARN string) *session.Session {
+	// Initial credentials loaded from SDK's default credential chain, such as
+	// the environment, shared credentials (~/.aws/credentials), or EC2 Instance
+	// Role.
+
+	var cfg aws.Config
+	var sess *session.Session
+
+	if region != "" {
+		cfg.Region = aws.String(region)
+	} else {
+		sess = session.Must(session.NewSession())
+		ec2metadata := ec2metadata.New(sess)
+		regionFound, err := ec2metadata.Region()
+		if err != nil {
+			logrus.WithError(err).Fatal("Region not found in config and failed to discover from ec2 instance metadata")
+		}
+		cfg.Region = aws.String(regionFound)
+	}
+
+	sess = session.Must(session.NewSession(&cfg))
+
+	if roleARN != "" {
+		logrus.WithFields(logrus.Fields{
+			"roleARN": roleARN,
+		}).Infof("Using assumed role for EC2 API")
+
+		ap := &stscreds.AssumeRoleProvider{
+			Client:   sts.New(sess),
+			RoleARN:  roleARN,
+			Duration: time.Duration(60) * time.Minute,
+		}
+
+		cfg.Credentials = credentials.NewCredentials(ap)
+		sess = session.Must(session.NewSession(&cfg))
+	}
+	return sess
+}
+
+func (p *nodeNameEC2PrivateDNSProvider) getPrivateDNSName(id string) (string, error) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	name, ok := p.nodeNameCache[id]
 	if ok {
 		return name, nil
 	}
 	return "", errors.New("instance id not found")
 }
 
-func (h *handler) setPrivateDNSName(id string, privateDNSName string) {
-	h.lock.Lock()
-	defer h.lock.Unlock()
-	h.nodeNameCache[id] = privateDNSName
+func (p *nodeNameEC2PrivateDNSProvider) setPrivateDNSName(id string, privateDNSName string) {
+	p.lock.Lock()
+	defer p.lock.Unlock()
+	p.nodeNameCache[id] = privateDNSName
 }
 
-func (h *handler) getPrivateDNSFromEC2(id string) (string, error) {
-	privateDNSName, err := h.getPrivateDNSName(id)
+// getNodeName looks up the private DNS from the EC2 API
+// and returns a username for the node matching the format that
+// kubelet uses: "system:node:<private-DNS>"
+func (p *nodeNameEC2PrivateDNSProvider) GetNodeName(id string) (string, error) {
+	privateDNSName, err := p.getPrivateDNSName(id)
 	if err == nil {
 		return config.NodeNamePrefix + privateDNSName, nil
 	}
 
 	// Look up instance from EC2 API
 	instanceIds := []*string{&id}
-	ec2Service := ec2.New(h.sess)
+	ec2Service := ec2.New(p.sess)
 	output, err := ec2Service.DescribeInstances(&ec2.DescribeInstancesInput{
 		InstanceIds: instanceIds,
 	})
@@ -373,7 +402,7 @@ func (h *handler) getPrivateDNSFromEC2(id string) (string, error) {
 		for _, instance := range reservation.Instances {
 			if aws.StringValue(instance.InstanceId) == id {
 				privateDNSName = aws.StringValue(instance.PrivateDnsName)
-				h.setPrivateDNSName(id, privateDNSName)
+				p.setPrivateDNSName(id, privateDNSName)
 			}
 		}
 	}
