@@ -320,32 +320,27 @@ type nodeNameEC2PrivateDNSProvider struct {
 
 func NewNodeNameEC2PrivateDNSProvider(region string, roleARN string) NodeNameProvider {
 	return &nodeNameEC2PrivateDNSProvider{
-		sess:          newSession(region, roleARN),
+		sess:          newSession(roleARN),
 		nodeNameCache: make(map[string]string),
 	}
 }
 
-func newSession(region string, roleARN string) *session.Session {
+func newSession(roleARN string) *session.Session {
 	// Initial credentials loaded from SDK's default credential chain, such as
 	// the environment, shared credentials (~/.aws/credentials), or EC2 Instance
 	// Role.
 
-	var cfg aws.Config
-	var sess *session.Session
-
-	if region != "" {
-		cfg.Region = aws.String(region)
-	} else {
-		sess = session.Must(session.NewSession())
+	sess := session.Must(session.NewSession())
+	cfg := &aws.Config{}
+	if aws.StringValue(sess.Config.Region) == "" {
 		ec2metadata := ec2metadata.New(sess)
 		regionFound, err := ec2metadata.Region()
 		if err != nil {
-			logrus.WithError(err).Fatal("Region not found in config and failed to discover from ec2 instance metadata")
+			logrus.WithError(err).Fatal("Region not found in shared credentials, environment variable, or instance metadata.")
 		}
+		//sess.Config.Region = aws.String(regionFound)
 		cfg.Region = aws.String(regionFound)
 	}
-
-	sess = session.Must(session.NewSession(&cfg))
 
 	if roleARN != "" {
 		logrus.WithFields(logrus.Fields{
@@ -358,10 +353,10 @@ func newSession(region string, roleARN string) *session.Session {
 			Duration: time.Duration(60) * time.Minute,
 		}
 
+		//sess.Config.Credentials = credentials.NewCredentials(ap)
 		cfg.Credentials = credentials.NewCredentials(ap)
-		sess = session.Must(session.NewSession(&cfg))
 	}
-	return sess
+	return session.Must(session.NewSession(cfg))
 }
 
 func (p *nodeNameEC2PrivateDNSProvider) getPrivateDNSName(id string) (string, error) {
