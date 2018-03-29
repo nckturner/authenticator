@@ -416,23 +416,45 @@ func (p *ec2ProviderImpl) getPrivateDNSName(id string) (string, error) {
 
 	// Look up instance from EC2 API
 	instanceIds := []*string{&id}
-	ec2Service := ec2.New(p.sess)
-	output, err := ec2Service.DescribeInstances(&ec2.DescribeInstancesInput{
+	request := &ec2.DescribeInstancesInput{
 		InstanceIds: instanceIds,
-	})
+	}
+
+	instances, err := p.describeInstances(request)
 	if err != nil {
 		return "", fmt.Errorf("failed querying private DNS from EC2 API for node %s: %s", id, err.Error())
 	}
-	for _, reservation := range output.Reservations {
-		for _, instance := range reservation.Instances {
-			if aws.StringValue(instance.InstanceId) == id {
-				privateDNSName = aws.StringValue(instance.PrivateDnsName)
-				p.setPrivateDNSNameCache(id, privateDNSName)
-			}
+
+	for _, instance := range instances {
+		if aws.StringValue(instance.InstanceId) == id {
+			privateDNSName = aws.StringValue(instance.PrivateDnsName)
+			p.setPrivateDNSNameCache(id, privateDNSName)
+			break
 		}
 	}
+
 	if privateDNSName == "" {
 		return "", fmt.Errorf("failed to find node %s", id)
 	}
 	return privateDNSName, nil
+}
+
+func (p *ec2ProviderImpl) describeInstances(request *ec2.DescribeInstancesInput) ([]*ec2.Instance, error) {
+	instances := []*ec2.Instance{}
+	ec2Service := ec2.New(p.sess)
+	for {
+		response, err := ec2Service.DescribeInstances(request)
+		if err != nil {
+			return nil, err
+		}
+		for _, reservation := range response.Reservations {
+			instances = append(instances, reservation.Instances...)
+		}
+
+		if aws.StringValue(response.NextToken) == "" {
+			break
+		}
+		request.NextToken = response.NextToken
+	}
+	return instances, nil
 }
